@@ -197,8 +197,12 @@ def emit(i, frm, to, **kw):
 
 def history_file(q):
     name, date = q.header()
-    os.makedirs(HIST, exist_ok=True)
     return os.path.join(HIST, f"{date}-{name}.md")
+
+
+def closed_count(q):
+    p = history_file(q)
+    return sum(1 for ln in rd(p).splitlines() if re.match(r"^- \[.\] \S+", ln)) if os.path.isfile(p) else 0
 
 
 # ---- detail files ----------------------------------------------------------
@@ -687,6 +691,7 @@ def set_status(q, i, status, fields):
         x.put(k, v)
     x.mark = mark(x.status)
     if x.status in DONE:
+        os.makedirs(HIST, exist_ok=True)
         with open(history_file(q), "a", encoding="utf-8") as f:
             f.write(x.line() + f" | closed: {now()}\n")
         q.lines.remove(x)
@@ -916,7 +921,9 @@ def cmd_status(a):
     act, it, note = decide(q)
     print(json.dumps({"exists": True, "base": B, "action": act, "open": open_count(q), "signature": signature(q), "session": rd(SESSION).strip() if os.path.isfile(SESSION) else "",
                       "item": it.id if it else None, "title": it.title if it else None, "note": note,
-                      "approvals": [x.id for x in q.items if x.status == "needs_approval"]}))
+                      "approvals": [x.id for x in q.items if x.status == "needs_approval"],
+                      "done": closed_count(q),
+                      "items": [{"id": x.id, "status": x.status, "prio": x.get("prio") or "-", "title": x.title} for x in q.items]}))
 
 
 def cmd_close(a):

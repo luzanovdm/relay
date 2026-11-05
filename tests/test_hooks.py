@@ -19,7 +19,8 @@ class Case:
     def __init__(self, **extra):
         self.dir = tempfile.mkdtemp()
         self.agent = os.path.join(self.dir, "agent")
-        self.env = {**os.environ, "RQ_DIR": self.agent, "RQ_BIN": RQ, "PYTHONWARNINGS": "error", **extra}
+        clean = {k: v for k, v in os.environ.items() if not k.startswith(("RQ_", "RELAY_"))}  # the caller's own settings must not leak in
+        self.env = {**clean, "RQ_DIR": self.agent, "RQ_BIN": RQ, "PYTHONWARNINGS": "error", **extra}
 
     def rq(self, *a, inp=None):
         r = subprocess.run([sys.executable, RQ, *a], cwd=self.dir, env=self.env, capture_output=True, text=True, input=inp)

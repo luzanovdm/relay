@@ -4,8 +4,10 @@ import json, os, subprocess, sys, tempfile
 
 RQ = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "skills", "relay", "bin", "rq")
 tmp = tempfile.mkdtemp()
-# PYTHONWARNINGS=error: a leaked file handle or other warning inside rq fails the run
-env = {**os.environ, "RQ_DIR": os.path.join(tmp, "agent"), "PYTHONWARNINGS": "error"}
+# PYTHONWARNINGS=error: a leaked file handle or other warning inside rq fails the run;
+# the caller's own RQ_*/RELAY_* settings are dropped so the run does not depend on them
+env = {**{k: v for k, v in os.environ.items() if not k.startswith(("RQ_", "RELAY_"))},
+       "RQ_DIR": os.path.join(tmp, "agent"), "PYTHONWARNINGS": "error"}
 
 
 def rd(p):
@@ -66,6 +68,9 @@ rq("evidence", j, "A1", "screenshot x.png")
 rq("set", j, "completed")
 assert "Q-002" not in rq("list")
 assert "ACTION: WORK Q-001" in rq("next", "--start")
+st = json.loads(rq("status", "--json"))  # the machine-readable queue the UI reads: open items plus the closed count
+assert [(x["id"], x["status"], x["prio"]) for x in st["items"]] == [("Q-001", "in_progress", "P1"), ("Q-003", "triage", "-")], st
+assert st["items"][0]["title"] == "label cursor" and st["done"] == 1, st
 rq("set", i, "implemented")
 assert "ACTION: VERIFY" in rq("next")
 assert "COMPLETED Q-001" in rq("verify")
