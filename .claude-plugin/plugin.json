@@ -1,0 +1,10 @@
+{
+  "name": "relay",
+  "version": "0.1.0",
+  "description": "A strict revision-queue work loop for coding agents: triage, one item at a time, proven acceptance criteria, and hooks that keep the loop from losing or half-finishing work.",
+  "author": { "name": "luzanovdm", "url": "https://github.com/luzanovdm" },
+  "homepage": "https://github.com/luzanovdm/relay",
+  "repository": "https://github.com/luzanovdm/relay",
+  "license": "MIT",
+  "keywords": ["workflow", "queue", "triage", "acceptance-criteria", "hooks"]
+}

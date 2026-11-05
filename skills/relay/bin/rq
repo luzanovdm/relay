@@ -1,0 +1,1034 @@
+#!/usr/bin/env python3
+"""rq - work-queue engine shared by Claude and Codex.
+
+The queue file is edited only through this tool, so the format cannot drift.
+  init BATCH            create the active queue
+  add TITLE             new item in `triage` + detail file (--original, --image/--desc)
+  next [--start]        what to do now (ACTION: INTAKE|WORK|TRIAGE_NEEDED|VERIFY|CLOSE|ASK|BLOCKED)
+  set ID STATUS [k=v..] change status/fields in place, guarded
+  check ID              run the fast: commands of an item's criteria
+  verify [ID..]         run run: commands, record evidence, complete proven items
+  evidence ID Ak TEXT   record manual evidence
+  show ID | list | lint | related PATH | stats | status --json
+  close [--carry IDS]   archive the batch | gc [--days N] [--apply]
+  inbox [--add|--skip N] verbatim user messages not yet turned into items (add --inbox N)
+  gate [--worktree]     commit gate: staged (or all changed) files vs files touched per item
+  refs WORDS [--pin ID] newest source-of-truth files by mtime
+  consumers PATH [--write ID]  consumers of a file from git grep, with their specs
+"""
+import argparse, datetime, json, os, re, shutil, subprocess, sys, time
+
+try:
+    import fcntl
+except ImportError:  # Windows has no fcntl; WSL works
+    sys.exit("rq: needs a POSIX system (macOS, Linux or WSL): queue writes are locked with fcntl")
+
+STATUSES = ["triage", "pending", "in_progress", "blocked", "implemented",
+            "needs_approval", "completed", "superseded"]
+DONE = {"completed", "superseded"}
+LEVELS = {"local", "shared", "kit", "contract", "architecture"}
+PRIO = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+
+
+def die(msg):
+    print("rq: " + msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def sh(*a):
+    return subprocess.check_output(a, stderr=subprocess.DEVNULL, text=True).strip()
+
+
+_top = []
+
+
+def top():
+    if not _top:
+        try:
+            _top.append(sh("git", "rev-parse", "--show-toplevel"))
+        except Exception:
+            _top.append(os.getcwd())
+    return _top[0]
+
+
+def git(*a):
+    return subprocess.check_output(("git",) + a, cwd=top(), stderr=subprocess.DEVNULL, text=True)
+
+
+def base():
+    if os.environ.get("RQ_DIR"):
+        return os.path.abspath(os.environ["RQ_DIR"])
+    try:
+        return os.path.abspath(sh("git", "rev-parse", "--git-path", "agent"))
+    except Exception:
+        return os.path.abspath(".agent")
+
+
+B = base()
+Q, D, HIST, ASSETS = (os.path.join(B, n) for n in
+                      ("revision-queue.md", "revision-queue", "revision-history", "revision-assets"))
+METRICS = os.path.join(D, "metrics.jsonl")
+SESSION = os.path.join(B, "session")  # id of the session that drives the queue, written by the PreToolUse hook
+
+
+def now():
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def rd(p, errors="strict"):
+    with open(p, encoding="utf-8", errors=errors) as f:
+        return f.read()
+
+
+def wr(p, text):
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def dpath(i):
+    return os.path.join(D, i + ".md")
+
+
+def clean(s):
+    return " ".join(str(s).split()).replace(" | ", " / ")
+
+
+def real(v):
+    v = (v or "").strip()
+    return bool(v) and not v.startswith(("<", "("))
+
+
+# ---- line model: "- [m] ID status title | key: value | ..." -------------------
+def parse_segs(rest):
+    head, *segs = rest.split(" | ")
+    return head, segs
+
+
+def split_crit(s):
+    """Split on ` | check:|fast:|run:|evidence:` only, so commands may contain pipes."""
+    parts = re.split(r" \| (?=(?:check|fast|run|evidence):)", s)
+    return parts[0], parts[1:]
+
+
+def seg_get(segs, key):
+    for s in segs:
+        if s.startswith(key + ":"):
+            return s[len(key) + 1:].strip()
+    return None
+
+
+def seg_set(segs, key, val):
+    val = clean(val)
+    for n, s in enumerate(segs):
+        if s.startswith(key + ":"):
+            segs[n] = f"{key}: {val}"
+            return
+    segs.append(f"{key}: {val}")
+
+
+def mark(status):
+    return "x" if status in DONE else "?" if status == "needs_approval" else " "
+
+
+class Item:
+    def __init__(self, raw):
+        m = re.match(r"^- \[(.)\] (\S+) ?(.*)$", raw)
+        self.mark, self.id, rest = m.groups()
+        st, _, rest = rest.partition(" ")
+        self.status = st
+        self.title, self.segs = parse_segs(rest)
+
+    def get(self, k):
+        return seg_get(self.segs, k)
+
+    def put(self, k, v):
+        seg_set(self.segs, k, v)
+
+    def line(self):
+        return f"- [{mark(self.status)}] {self.id} {self.status} {self.title}" + "".join(" | " + s for s in self.segs)
+
+    @property
+    def prio(self):
+        return PRIO.get((self.get("prio") or "").upper(), 9)
+
+    @property
+    def num(self):
+        m = re.search(r"(\d+)$", self.id)
+        return int(m.group(1)) if m else 0
+
+
+class Queue:
+    def __init__(self):
+        if not os.path.isfile(Q):
+            die("no active queue (rq init BATCH)")
+        self.lines = []
+        for ln in rd(Q).splitlines():
+            self.lines.append(Item(ln) if re.match(r"^- \[.\] \S+", ln) else ln)
+
+    @property
+    def items(self):
+        return [x for x in self.lines if isinstance(x, Item)]
+
+    def get(self, i):
+        for x in self.items:
+            if x.id == i:
+                return x
+        die(f"no open item {i}")
+
+    def save(self):
+        tmp = Q + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("\n".join(x.line() if isinstance(x, Item) else x for x in self.lines) + "\n")
+        os.replace(tmp, Q)
+
+    def header(self):
+        h = self.lines[0] if self.lines and isinstance(self.lines[0], str) else ""
+        m = re.search(r"batch:\s*([^|]+)", h)
+        s = re.search(r"started\s+(\d{4}-\d{2}-\d{2})", h)
+        name = re.sub(r"[^\w.-]+", "-", (m.group(1).strip() if m else "batch")).strip("-")
+        return name, (s.group(1) if s else datetime.date.today().isoformat())
+
+
+def emit(i, frm, to, **kw):
+    os.makedirs(D, exist_ok=True)
+    with open(METRICS, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": now(), "id": i, "from": frm, "to": to, **kw}) + "\n")
+
+
+def history_file(q):
+    name, date = q.header()
+    os.makedirs(HIST, exist_ok=True)
+    return os.path.join(HIST, f"{date}-{name}.md")
+
+
+# ---- detail files ----------------------------------------------------------
+def sections(text):
+    out, cur = {}, None
+    for ln in text.splitlines():
+        m = re.match(r"^## (.+?)\s*$", ln)
+        if m:
+            cur = m.group(1).lower()
+            out[cur] = ""
+        elif cur:
+            out[cur] += ln + "\n"
+    return out
+
+
+def criteria(text):
+    out = []
+    for ln in sections(text).get("acceptance criteria", "").splitlines():
+        m = re.match(r"^- (A\d+): (.*)$", ln)
+        if m:
+            head, segs = split_crit(m.group(2))
+            out.append({"id": m.group(1), "text": head, "segs": segs, "line": ln})
+    return out
+
+
+def read_detail(i):
+    p = dpath(i)
+    if not os.path.isfile(p):
+        return None
+    return rd(p)
+
+
+def triaged(i):
+    t = read_detail(i)
+    if t is None:
+        return False, f"no detail file {dpath(i)}"
+    s = sections(t)
+    m = re.search(r"^level:\s*(\w+)", s.get("cause", ""), re.M)
+    if not m or m.group(1) not in LEVELS:
+        return False, "Cause needs `level:` " + "|".join(sorted(LEVELS))
+    sol = s.get("solution", "").strip()
+    if len(sol) < 20 or sol.startswith("("):
+        return False, "Solution is empty"
+    cr = criteria(t)
+    if not cr or any(not real(seg_get(c["segs"], "check")) for c in cr):
+        return False, "every criterion needs `- A<n>: text | check: how proven`"
+    return True, ""
+
+
+def write_criterion(i, cid, key, val):
+    p = dpath(i)
+    lines = rd(p).split("\n")
+    for n, ln in enumerate(lines):
+        if re.match(rf"^- {cid}: ", ln):
+            head, segs = split_crit(ln[len(f"- {cid}: "):])
+            seg_set(segs, key, val)
+            lines[n] = f"- {cid}: {head}" + "".join(" | " + s for s in segs)
+            wr(p, "\n".join(lines))
+            return
+    die(f"{i} has no criterion {cid}")
+
+
+TEMPLATE = """# {id} {title}
+## Original
+{original}
+
+received: {ts}
+attachments:
+{attach}
+## Cause
+level: <local|shared|kit|contract|architecture>
+evidence: <file:line, why the symptom appears>
+consumers: <every consumer of the affected unit, with date/HEAD>
+## Solution
+(root-level fix: owner -> state/contract -> consumer -> recovery; consumers that change; what is NOT done)
+## Acceptance criteria
+- A1: <original failure no longer reproduces> | check: <how proven> | fast: <cmd> | run: <cmd> | evidence:
+## Refs
+(exact source-of-truth files with mtime)
+## Priority
+prio: P? size: S|M|L deps:
+## Confidence
+confidence: high|low | approval: no|yes (reason)
+"""
+
+
+# ---- touched files per item (commit gate) ---------------------------------------
+def snap():
+    """{path: content hash} of every uncommitted file (staged, modified, untracked); one git call for hashing."""
+    try:
+        parts = git("status", "--porcelain", "-z", "-uall").split("\0")
+    except Exception:
+        return {}
+    paths, k = [], 0
+    while k < len(parts):
+        e = parts[k]
+        k += 1
+        if len(e) < 4:
+            continue
+        if "R" in e[:2] or "C" in e[:2]:
+            k += 1
+        paths.append(e[3:])
+    live = [p for p in paths if os.path.isfile(os.path.join(top(), p)) and "\n" not in p]
+    hashes = {}
+    if live:
+        r = subprocess.run(["git", "hash-object", "--stdin-paths"], cwd=top(), input="\n".join(live) + "\n",
+                           capture_output=True, text=True)
+        hashes = dict(zip(live, r.stdout.split()))
+    return {p: hashes.get(p, "gone") for p in paths}
+
+
+def jload(p, default):
+    try:
+        return json.loads(rd(p))
+    except Exception:
+        return default
+
+
+def touched_of(i, status, now_=None):
+    base_ = jload(os.path.join(D, i + ".base.json"), None)
+    if base_ is None:
+        return []
+    now_ = snap() if now_ is None else now_
+    if status == "in_progress":
+        return sorted(f for f, h in now_.items() if base_.get(f) != h)
+    return sorted(f for f in jload(os.path.join(D, i + ".touched.json"), []) if f in now_)
+
+
+def cmd_gate(a):
+    if not os.path.isfile(Q):
+        return
+    q = Queue()
+    try:
+        staged = set(git("diff", "--name-only", "HEAD").split() if a.worktree else git("diff", "--cached", "--name-only").split())
+    except Exception:
+        return
+    claims, now_ = {}, snap()
+    for x in q.items:
+        if x.status in ("in_progress", "implemented"):
+            for f in touched_of(x.id, x.status, now_):
+                claims.setdefault(f, []).append(x)
+    bad = []
+    for f in sorted(staged):
+        who = claims.get(f, [])
+        if any(x.status == "in_progress" for x in who):
+            bad.append(f"{f}: belongs to unfinished {next(x.id for x in who if x.status == 'in_progress')} (rq set implemented first)")
+        elif len({x.id for x in who}) > 1:
+            bad.append(f"{f}: touched by several items {','.join(x.id for x in who)} (commit them apart or split the change)")
+    print("\n".join(bad) or "ok")
+    sys.exit(1 if bad else 0)
+
+
+# ---- inbox: every user message is stored verbatim before anything else ----------
+INBOX = os.path.join(B, "inbox.jsonl")
+
+
+def inbox_all():
+    try:
+        return [json.loads(l) for l in rd(INBOX).splitlines() if l.strip()]
+    except Exception:
+        return []
+
+
+def inbox_save(rows):
+    os.makedirs(B, exist_ok=True)
+    with open(INBOX, "w", encoding="utf-8") as f:
+        f.write("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
+
+
+def inbox_new():
+    return [r for r in inbox_all() if r["state"] == "new"]
+
+
+def cmd_inbox(a):
+    rows = inbox_all()
+    if a.add:
+        text = sys.stdin.read().strip()
+        if not text:
+            die("empty message")
+        n = max([r["n"] for r in rows] + [0]) + 1
+        rows.append({"n": n, "ts": now(), "text": text, "state": "new"})
+        inbox_save(rows)
+        print(n)
+        return
+    if a.skip:
+        want = {int(n) for n in a.skip.split(",")}
+        hit = [r for r in rows if r["n"] in want and r["state"] == "new"]
+        if len(hit) != len(want):
+            die(f"not all of {a.skip} are new inbox messages")
+        for r in hit:
+            r["state"] = "skipped"
+        inbox_save(rows)
+        print("ok")
+        return
+    for r in rows:
+        if r["state"] == "new":
+            print(f"#{r['n']} {r['ts']}\n{r['text']}\n")
+
+
+def take_inbox(n, item):
+    rows = inbox_all()
+    for r in rows:
+        if r["n"] == n and r["state"] == "new":
+            r["state"], r["item"] = "taken", item
+            inbox_save(rows)
+            return r["text"]
+    die(f"no new inbox message {n}")
+
+
+# ---- refs: sources of truth resolved by mtime ----------------------------------
+SKIP = {"node_modules", ".git", "dist", "build", "target", "vendor", "Pods", "DerivedData", ".build", ".angular",
+        ".nx", ".next", ".venv", "venv", "__pycache__"}
+REF_EXT = {".md", ".html", ".png", ".webp", ".jpg", ".jpeg", ".svg", ".pdf", ".pen", ".fig", ".json", ".txt"}
+
+
+def cmd_refs(a):
+    roots = a.root or [r for r in os.environ.get("RQ_ROOTS", "").split(":") if r] or [top(), B]
+    words = [w.lower() for w in a.words]
+    hits = []
+
+    def consider(root, rel):
+        if os.path.splitext(rel)[1].lower() in REF_EXT and all(w in rel.lower() for w in words):
+            p = os.path.join(root, rel)
+            if os.path.isfile(p):
+                hits.append((os.path.getmtime(p), p))
+    for root in roots:
+        if os.path.realpath(root) == os.path.realpath(top()):
+            try:  # tracked + untracked, honoring .gitignore: build output never wins on mtime
+                for rel in git("ls-files", "-co", "--exclude-standard").splitlines():
+                    consider(root, rel)
+                continue
+            except Exception:
+                pass
+        for dp, dn, fs in os.walk(root):
+            dn[:] = [d for d in dn if d not in SKIP and d != "revision-history"]
+            for f in fs:
+                consider(root, os.path.relpath(os.path.join(dp, f), root))
+    hits.sort(reverse=True)
+    if not hits:
+        die("no files match " + " ".join(a.words))
+    day = lambda t: datetime.date.fromtimestamp(t).isoformat()
+    for t, p in hits[:a.n]:
+        print(f"{day(t)}  {p}")
+    if len(hits) > 1 and os.path.dirname(hits[0][1]) != os.path.dirname(hits[1][1]):
+        print(f"CHECK: newest is in {os.path.dirname(hits[0][1])}, next in {os.path.dirname(hits[1][1])}; confirm the newest is the intended source")
+    if a.pin:
+        t, p = hits[0]
+        dp_ = dpath(a.pin)
+        txt = read_detail(a.pin)
+        if txt is None:
+            die(f"no detail for {a.pin}")
+        line = f"- {p} (mtime {day(t)})"
+        txt = re.sub(r"(## Refs\n)\(exact source[^\n]*\n", r"\1", txt)
+        txt = re.sub(r"(## Refs\n)", lambda m: m.group(1) + line + "\n", txt, count=1)
+        wr(dp_, txt)
+        print("pinned to", a.pin)
+
+
+# ---- consumers of a file from git grep -------------------------------------------
+# top-level definitions in TS/JS, Python, Swift, Go, Kotlin, Java, Rust: the names other files refer to
+SYMBOL = re.compile(r"^(?:export\s+(?:default\s+)?)?(?:(?:public|open|final|abstract|async|pub)\s+)*"
+                    r"(?:class|interface|enum|struct|protocol|trait|func|fn|function|def|const|type)\s+(\w+)", re.M)
+TEST_STYLES = ("{b}.spec{e}", "{b}.test{e}", "{b}_test{e}", "test_{b}{e}", "{b}Tests{e}", "{b}Test{e}")
+
+
+def test_of(rel):
+    """The test file next to (or under tests/, __tests__/) a source file, by the common naming styles."""
+    d, f = os.path.split(rel)
+    ext = os.path.splitext(f)[1]
+    exts = {ext} | ({".ts"} if ext in (".html", ".scss", ".css") else set())  # template/style -> its component spec
+    names = [t.format(b=b, e=e) for b in dict.fromkeys((f.rsplit(".", 1)[0], f.split(".")[0])) for e in sorted(exts) for t in TEST_STYLES]
+    for dd in (d, os.path.join(d, "__tests__"), "tests", "test"):
+        for n in names:
+            p = os.path.join(dd, n)
+            if p != rel and os.path.isfile(os.path.join(top(), p)):
+                return p
+    return None
+
+
+def cmd_consumers(a):
+    fp = os.path.join(top(), a.path) if not os.path.isabs(a.path) else a.path
+    rel = os.path.relpath(fp, top())
+    src = rd(fp, errors="ignore") if os.path.isfile(fp) else ""
+    stem = os.path.basename(rel).split(".")[0]
+    toks = {stem} | set(re.findall(r"selector:\s*['\"]([\w-]+)['\"]", src)) | set(SYMBOL.findall(src))
+    toks = {t for t in toks if len(t) > 3}
+    found = {}
+    for t in sorted(toks):
+        try:
+            for f in git("grep", "-l", "-F", "-e", t, "--", ".", ":!node_modules", ":!*.md").split():
+                if f != rel:
+                    found.setdefault(f, set()).add(t)
+        except Exception:
+            pass
+    specs = {f: sp for f in sorted(found) if (sp := test_of(f))}
+    print(f"consumers of {rel} via {', '.join(sorted(toks)) or '-'}: {len(found)}")
+    for f in sorted(found):
+        print(f"  {f}" + (f"  spec: {specs[f]}" if f in specs else ""))
+    if a.write:
+        head = git("rev-parse", "--short", "HEAD").strip()
+        val = f"consumers: {', '.join(sorted(found)) or 'none'} @ {head} {datetime.date.today()}"
+        txt = read_detail(a.write)
+        if txt is None:
+            die(f"no detail for {a.write}")
+        txt = re.sub(r"^consumers:.*$", lambda m: val, txt, count=1, flags=re.M)
+        wr(dpath(a.write), txt)
+        print("written to", a.write)
+
+
+# ---- commands --------------------------------------------------------------
+def cmd_init(a):
+    if os.path.isfile(Q):
+        die("queue exists")
+    os.makedirs(B, exist_ok=True)
+    try:
+        owner = a.owner or sh("git", "branch", "--show-current")
+    except Exception:
+        owner = a.owner
+    wr(Q, f"# batch: {clean(a.batch)} | started {datetime.date.today()} | owner {owner or '-'}\n")
+    print(Q)
+
+
+def next_id():
+    ids = [0]
+    for dp, _, fs in os.walk(B):
+        for f in fs:
+            m = re.match(r"^Q-(\d+)\b", f)
+            if m:
+                ids.append(int(m.group(1)))
+            if f.endswith(".md") and not f.startswith("Q-"):
+                try:
+                    ids += [int(n) for n in re.findall(r"^- \[.\] Q-(\d+)\b", rd(os.path.join(dp, f)), re.M)]
+                except Exception:
+                    pass
+    return f"Q-{max(ids) + 1:03d}"
+
+
+def cmd_add(a):
+    q = Queue()
+    if a.inbox and a.original:
+        die("--inbox takes the stored message; do not pass --original")
+    if len(a.image) > len(a.desc):
+        die("each --image needs a --desc (visible details, written once, so the image is not reloaded)")
+    i = next_id()
+    if a.inbox:
+        original = take_inbox(a.inbox, i)
+    else:
+        original = sys.stdin.read().strip() if a.original == "-" else (a.original or "")
+    if not original.strip():
+        die("empty Original: pass --original TEXT|- or --inbox N")
+    attach = [f"- pasted image (no file): {clean(d)}" for d in a.desc[len(a.image):]]
+    for p, d in zip(a.image, a.desc):
+        if not os.path.isfile(p):
+            die(f"image not found: {p}")
+        dst = os.path.join(ASSETS, i)
+        os.makedirs(dst, exist_ok=True)
+        shutil.copy2(p, dst)
+        attach.append(f"- {os.path.join('revision-assets', i, os.path.basename(p))}: {clean(d)}")
+    os.makedirs(D, exist_ok=True)
+    wr(dpath(i), TEMPLATE.format(
+        id=i, title=clean(a.title), original=original, ts=now(), attach="\n".join(attach) or "-"))
+    it = Item(f"- [ ] {i} triage {clean(a.title)}")
+    for k in ("prio", "family"):
+        if getattr(a, k):
+            it.put(k, getattr(a, k))
+    q.lines.append(it)
+    q.save()
+    emit(i, None, "triage")
+    print(i, dpath(i))
+
+
+def counts(q):
+    c = {s: 0 for s in STATUSES}
+    for x in q.items:
+        c[x.status] = c.get(x.status, 0) + 1
+    return c
+
+
+def decide(q):
+    its = q.items
+    ip = [x for x in its if x.status == "in_progress"]
+    pend = [x for x in its if x.status == "pending"]
+    ok = [x for x in pend if triaged(x.id)[0]]
+    ok.sort(key=lambda x: (x.prio, x.get("next") is None, x.num))  # a paused item resumes before fresh ones
+    raw = [x for x in pend if x not in ok] + [x for x in its if x.status == "triage"]
+    raw_ids = ",".join(x.id for x in raw)
+    triage_note = f"untriaged, triage them in parallel: {raw_ids}" if raw else ""
+    c = counts(q)
+    inbox = inbox_new()
+    if ip:
+        notes = ([f"inbox: {len(inbox)} new message(s), convert after this step"] if inbox else []) + ([triage_note] if raw else [])
+        return "WORK", ip[0], "; ".join(notes)
+    if inbox:
+        return "INTAKE", None, f"{len(inbox)} message(s): rq inbox"
+    if ok:
+        return "WORK", ok[0], triage_note
+    if c["implemented"]:
+        return "VERIFY", None, triage_note
+    if raw:
+        return "TRIAGE_NEEDED", raw[0], raw_ids
+    if c["blocked"] and not c["needs_approval"]:
+        return "BLOCKED", None, ",".join(x.id for x in its if x.status == "blocked")
+    if c["needs_approval"] or c["blocked"]:
+        return "ASK", None, ",".join(x.id for x in its if x.status in ("needs_approval", "blocked"))
+    return "CLOSE", None, ""
+
+
+def signature(q):
+    return ";".join(f"{x.id}={x.status}" for x in sorted(q.items, key=lambda x: x.id)) + f";inbox={len(inbox_new())}"
+
+
+def open_count(q):
+    n = sum(1 for x in q.items if mark(x.status) == " ") + len(inbox_new())
+    return n or (1 if decide(q)[0] == "CLOSE" else 0)
+
+
+def cmd_next(a):
+    q = Queue()
+    act, it, note = decide(q)
+    if act == "WORK" and a.start and it.status != "in_progress":
+        set_status(q, it.id, "in_progress", {})
+    c = counts(q)
+    print(f"ACTION: {act}" + (f" {it.id}" if it else ""))
+    if it:
+        print(f"item: {it.id} {it.title}\nprio: {it.get('prio') or '-'}  next: {it.get('next') or '-'}\ndetail: {dpath(it.id)}")
+        t = read_detail(it.id)
+        for cr in criteria(t or ""):
+            print(f"  {cr['id']}: {cr['text']} | check: {seg_get(cr['segs'], 'check')}")
+    if note:
+        print("note:", note)
+    print("queue: " + " ".join(f"{k}={v}" for k, v in c.items() if v and k not in DONE))
+    hints = {"INTAKE": "rq inbox; per message: rq add TITLE --inbox N (a request) or rq inbox --skip N (not a request)",
+             "VERIFY": "run: rq verify", "TRIAGE_NEEDED": "triage now, inline or via a read-only subagent: fill the detail file, then rq set ID pending",
+             "CLOSE": "run: rq close", "ASK": "tell the user the pending decisions; resolve with rq set ID pending answer=..."}
+    if act in hints:
+        print("hint:", hints[act])
+
+
+def set_status(q, i, status, fields):
+    x = q.get(i)
+    if status and status != "-":
+        if status not in STATUSES:
+            die("status must be one of " + ", ".join(STATUSES))
+        old = x.status
+        if status == "in_progress":
+            other = [y.id for y in q.items if y.status == "in_progress" and y.id != i]
+            if other:
+                die(f"{other[0]} is already in_progress (one at a time)")
+        if status in ("in_progress", "pending", "implemented") and old != status:
+            ok, why = triaged(i)
+            if not ok:
+                die(f"{i} is not triaged: {why}")
+        if status == "implemented" and old != "in_progress":
+            die(f"{i}: implemented only from in_progress (is {old})")
+        if old == "needs_approval" and status not in ("needs_approval", "superseded") and not fields.get("answer"):
+            die(f"{i} leaves needs_approval only with answer=<the user's words or inbox #N>")
+        if status == "blocked" and not fields.get("reason") and not x.get("reason"):
+            die("blocked requires reason=<what is missing>")
+        if status == "completed" and old != "implemented":
+            die(f"{i}: completed only from implemented (is {old}); go through in_progress -> implemented -> rq verify")
+        if status == "needs_approval" and not fields.get("decision") and not x.get("decision"):
+            die("needs_approval requires decision=<one line>")
+        if status == "superseded" and not fields.get("reason"):
+            die("superseded requires reason=<why>")
+        if status == "completed":
+            t = read_detail(i)
+            cr = criteria(t or "")
+            miss = [c["id"] for c in cr if not real(seg_get(c["segs"], "evidence"))]
+            if not cr or miss:
+                die(f"{i}: no evidence for {', '.join(miss) or 'any criterion'} (rq verify / rq evidence)")
+        x.status = status
+        emit(i, old, status)
+        bp = os.path.join(D, i + ".base.json")
+        if status == "in_progress" and old != "in_progress":
+            for c_ in criteria(read_detail(i) or ""):  # a reopened item proves its criteria again
+                if seg_get(c_["segs"], "evidence"):
+                    write_criterion(i, c_["id"], "evidence", "")
+        if status == "in_progress" and not os.path.exists(bp):
+            os.makedirs(D, exist_ok=True)
+            wr(bp, json.dumps(snap()))
+        if status == "implemented":
+            tf = touched_of(i, "in_progress")
+            wr(os.path.join(D, i + ".touched.json"), json.dumps(tf))
+            x.put("touched", f"{len(tf)} files")
+    for k, v in fields.items():
+        x.put(k, v)
+    x.mark = mark(x.status)
+    if x.status in DONE:
+        with open(history_file(q), "a", encoding="utf-8") as f:
+            f.write(x.line() + f" | closed: {now()}\n")
+        q.lines.remove(x)
+    q.save()
+
+
+def cmd_set(a):
+    f = {}
+    for kv in a.fields:
+        k, _, v = kv.partition("=")
+        if not v:
+            die(f"bad field {kv!r}, use key=value")
+        f[k] = v
+    set_status(Queue(), a.id, a.status, f)
+    print("ok")
+
+
+def run_cmd(cmd, timeout):
+    t0 = time.time()
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, cwd=top())
+        out, code = (r.stdout + r.stderr), r.returncode
+    except subprocess.TimeoutExpired:
+        out, code = "timeout", 124
+    return code, int((time.time() - t0) * 1000), out
+
+
+def cmd_check(a):
+    q = Queue()
+    x = q.get(a.id)
+    bad = n = 0
+    for cr in criteria(read_detail(x.id) or ""):
+        fast = seg_get(cr["segs"], "fast")
+        if not real(fast):
+            continue
+        n += 1
+        code, ms, out = run_cmd(fast, a.timeout)
+        print(f"{cr['id']} {'PASS' if code == 0 else 'FAIL'} {ms}ms  {fast}")
+        if code:
+            bad += 1
+            print("\n".join(out.strip().splitlines()[-12:]))
+        emit(x.id, None, None, kind="check", crit=cr["id"], ok=code == 0, ms=ms)
+    if not n:
+        print(f"no fast: checks defined for {x.id}")
+    sys.exit(1 if bad else 0)
+
+
+def run_playwright(files, timeout):
+    """One Playwright run for every `pw:` criterion; {spec file: passed}. Skipped specs do not pass."""
+    import tempfile
+    out_json = os.path.join(tempfile.mkdtemp(), "report.json")
+    cmd = f"PLAYWRIGHT_JSON_OUTPUT_NAME={out_json} " + os.environ.get("RQ_PW", "npx playwright test --reporter=json") + " " + " ".join(files)
+    code, ms, out = run_cmd(cmd, timeout)
+    res = {}
+    try:
+        data = json.loads(rd(out_json))
+    except Exception:
+        print("playwright wrote no JSON report:\n" + "\n".join(out.strip().splitlines()[-12:]))
+        return res, ms
+
+    def same(want, f):
+        w, f = os.path.normpath(want), os.path.normpath(f or "")
+        return f != "." and (w == f or w.endswith(os.sep + f) or f.endswith(os.sep + w))
+
+    def walk(suite, inherited=None):
+        f = suite.get("file") or inherited
+        for sp in suite.get("specs", []):
+            for want in files:
+                if same(want, sp.get("file") or f):
+                    ran = any(t.get("status") == "expected" for t in sp.get("tests", []))
+                    res[want] = res.get(want, True) and bool(sp.get("ok")) and ran
+        for sub in suite.get("suites", []):
+            walk(sub, f)
+    for su in data.get("suites", []):
+        walk(su)
+    return res, ms
+
+
+def cmd_verify(a):
+    q = Queue()
+    targets = [q.get(i) for i in a.ids] if a.ids else [x for x in q.items if x.status == "implemented"]
+    if any(x.status != "implemented" for x in targets):
+        die("verify only runs on implemented items: " + ",".join(x.id for x in targets if x.status != "implemented"))
+    fail = manual = 0
+    failed, batch = set(), []
+    for x in targets:
+        for cr in criteria(read_detail(x.id) or ""):
+            if real(seg_get(cr["segs"], "evidence")):
+                continue
+            run = seg_get(cr["segs"], "run")
+            if real(run) and run.startswith("pw:"):
+                batch.append((x, cr, run[3:].strip()))
+                continue
+            if not real(run):
+                manual += 1
+                print(f"MANUAL {x.id} {cr['id']}: {cr['text']} | check: {seg_get(cr['segs'], 'check')}")
+                continue
+            code, ms, out = run_cmd(run, a.timeout)
+            emit(x.id, None, None, kind="verify", crit=cr["id"], ok=code == 0, ms=ms)
+            if code == 0:
+                write_criterion(x.id, cr["id"], "evidence", f"auto {now()} exit 0 {ms}ms")
+                print(f"PASS {x.id} {cr['id']} {ms}ms")
+            else:
+                fail += 1
+                failed.add(x.id)
+                print(f"FAIL {x.id} {cr['id']} {ms}ms  {run}\n" + "\n".join(out.strip().splitlines()[-12:]))
+    if batch:
+        res, ms = run_playwright(sorted({f for _, _, f in batch}), a.timeout)
+        for x, cr, f in batch:
+            ok = res.get(f)
+            emit(x.id, None, None, kind="verify", crit=cr["id"], ok=bool(ok), ms=ms)
+            if ok:
+                write_criterion(x.id, cr["id"], "evidence", f"auto {now()} playwright {f} (one batched run, {ms}ms)")
+                print(f"PASS {x.id} {cr['id']} {f}")
+            else:
+                fail += 1
+                failed.add(x.id)
+                print(f"FAIL {x.id} {cr['id']} {f} ({'not run' if ok is None else 'failed'})")
+    q = Queue()  # reload: commands ran for a while
+    for x in targets:
+        cr = criteria(read_detail(x.id) or "")
+        if x.id in failed:
+            set_status(q, x.id, "pending", {"next": "verification failed, fix and re-run rq verify"})
+            print(f"REOPENED {x.id}")
+        elif cr and all(real(seg_get(c["segs"], "evidence")) for c in cr):
+            set_status(q, x.id, "completed", {})
+            print(f"COMPLETED {x.id}")
+    print(f"summary: fail={fail} manual={manual}")
+    sys.exit(1 if fail else 0)
+
+
+def cmd_evidence(a):
+    if not real(a.text):
+        die("evidence must be real text or a file path")
+    write_criterion(a.id, a.crit, "evidence", a.text)
+    print("ok")
+
+
+def cmd_show(a):
+    t = read_detail(a.id)
+    if t is None:
+        die(f"no detail for {a.id}")
+    print(t)
+    tf = jload(os.path.join(D, a.id + ".touched.json"), [])
+    if tf:
+        print("## Touched\n" + "\n".join("- " + f for f in tf))
+
+
+def cmd_list(a):
+    q = Queue()
+    for x in q.items:
+        if a.all or mark(x.status) != "x":
+            print(f"{x.id:7} {x.status:14} {x.get('prio') or '-':3} {x.title}")
+
+
+def cmd_lint(a):
+    q = Queue()
+    bad, seen = [], set()
+    ips = [x.id for x in q.items if x.status == "in_progress"]
+    if len(ips) > 1:
+        bad.append("several in_progress: " + ",".join(ips))
+    for ln in q.lines:
+        if isinstance(ln, str) and re.search(r"\bSTATUS\b", ln):
+            bad.append("appended STATUS line: " + ln[:60])
+    for x in q.items:
+        if x.id in seen:
+            bad.append(f"duplicate {x.id}")
+        seen.add(x.id)
+        if x.status not in STATUSES:
+            bad.append(f"{x.id}: unknown status {x.status!r}")
+            continue
+        if x.mark != mark(x.status):
+            bad.append(f"{x.id}: mark [{x.mark}] does not match {x.status}")
+        if x.status in ("pending", "in_progress", "implemented") and not triaged(x.id)[0]:
+            bad.append(f"{x.id}: {x.status} but untriaged ({triaged(x.id)[1]})")
+    print("\n".join(bad) or "ok")
+    sys.exit(1 if bad else 0)
+
+
+def cmd_related(a):
+    n = 0
+    for root in (D, HIST):
+        for dp, _, fs in os.walk(root):
+            for f in sorted(fs):
+                p = os.path.join(dp, f)
+                try:
+                    for ln in rd(p).splitlines():
+                        if a.path in ln and n < 20:
+                            print(f"{os.path.relpath(p, B)}: {ln.strip()[:160]}")
+                            n += 1
+                except Exception:
+                    pass
+
+
+def events():
+    try:
+        return [json.loads(l) for l in rd(METRICS).splitlines()]
+    except Exception:
+        return []
+
+
+def cmd_stats(a):
+    ev, per = events(), {}
+    for e in ev:
+        p = per.setdefault(e["id"], {"start": None, "impl": None, "reopen": 0, "fails": 0, "checks_ms": 0})
+        t = datetime.datetime.fromisoformat(e["ts"])
+        if e.get("to") == "in_progress" and not p["start"]:
+            p["start"] = t
+        if e.get("to") == "implemented" and not p["impl"]:
+            p["impl"] = t
+        if e.get("from") == "implemented" and e.get("to") in ("in_progress", "pending"):
+            p["reopen"] += 1
+        if e.get("kind") in ("check", "verify"):
+            p["checks_ms"] += e.get("ms", 0)
+            p["fails"] += 0 if e.get("ok") else 1
+    print(f"{'id':8}{'work_min':>9}{'reopen':>7}{'fails':>6}{'check_s':>8}")
+    for i, p in sorted(per.items()):
+        w = round((p["impl"] - p["start"]).total_seconds() / 60, 1) if p["start"] and p["impl"] else "-"
+        print(f"{i:8}{w!s:>9}{p['reopen']:>7}{p['fails']:>6}{p['checks_ms'] // 1000:>8}")
+
+
+def cmd_status(a):
+    if not os.path.isfile(Q):
+        print(json.dumps({"exists": False, "base": B}))
+        return
+    q = Queue()
+    act, it, note = decide(q)
+    print(json.dumps({"exists": True, "base": B, "action": act, "open": open_count(q), "signature": signature(q), "session": rd(SESSION).strip() if os.path.isfile(SESSION) else "",
+                      "item": it.id if it else None, "title": it.title if it else None, "note": note,
+                      "approvals": [x.id for x in q.items if x.status == "needs_approval"]}))
+
+
+def cmd_close(a):
+    q = Queue()
+    carry = set(a.carry.split(",")) if a.carry else set()
+    left = [x for x in q.items if x.id not in carry]
+    if inbox_new():
+        die(f"{len(inbox_new())} inbox message(s) not converted (rq inbox)")
+    if left:
+        die("not closable, unfinished: " + ", ".join(f"{x.id}({x.status})" for x in left) + " (finish them or --carry)")
+    unknown = carry - {x.id for x in q.items}
+    if unknown:
+        die("unknown --carry ids: " + ",".join(sorted(unknown)))
+    name, date = q.header()
+    arch = os.path.join(HIST, f"{date}-{name}")
+    if os.path.isdir(arch):
+        arch += time.strftime("-%H%M%S")
+    os.makedirs(arch, exist_ok=True)
+    if os.path.isdir(ASSETS):
+        for f in os.listdir(ASSETS):
+            if f not in carry:
+                shutil.move(os.path.join(ASSETS, f), os.path.join(arch, "assets-" + f))
+    if os.path.isdir(D):
+        for f in os.listdir(D):
+            if f.split(".")[0] in carry:
+                continue
+            shutil.move(os.path.join(D, f), os.path.join(arch, f))
+    if os.path.isfile(INBOX):
+        shutil.move(INBOX, os.path.join(arch, "inbox.jsonl"))
+    if carry:
+        q.lines = [x for x in q.lines if not isinstance(x, Item) or x.id in carry]
+        q.save()
+    else:
+        os.remove(Q)
+        if os.path.isfile(SESSION):
+            os.remove(SESSION)
+        if os.path.isdir(D) and not os.listdir(D):
+            os.rmdir(D)
+    print("archived:", arch, "+", os.path.join(HIST, f"{date}-{name}.md"))
+
+
+def cmd_gc(a):
+    """Old private agent files under the git dir. Dry run unless --apply."""
+    if "RQ_DIR" not in os.environ:
+        try:
+            sh("git", "rev-parse", "--git-dir")
+        except Exception:
+            die("gc only works inside a git checkout (private files live in its git dir)")
+    extra = [n for n in os.environ.get("RQ_GC_EXTRA", "").split(":") if n]  # more private dirs next to B, by name
+    protect = {".lock", "session", "RESUME.md", "PLAN.md", "revision-queue.md", "revision-queue", "revision-assets",
+               "revision-history", "hook-state.json", "inbox.jsonl"}
+    cut, total, hits = time.time() - a.days * 86400, 0, []
+    for d in [B] + [os.path.join(os.path.dirname(B), n) for n in extra]:
+        if not os.path.isdir(d):
+            continue
+        for f in os.listdir(d):
+            p = os.path.join(d, f)
+            if f in protect or f == ".DS_Store" or os.path.getmtime(p) > cut:
+                continue
+            sz = sum(os.path.getsize(os.path.join(r, x)) for r, _, fs in os.walk(p) for x in fs) if os.path.isdir(p) else os.path.getsize(p)
+            hits.append((sz, p))
+            total += sz
+    for sz, p in sorted(hits, reverse=True)[:25]:
+        print(f"{sz // 1024:>7} KB  {p}")
+    print(f"{len(hits)} entries, {total // 1024} KB older than {a.days} days")
+    if a.apply:
+        for _, p in hits:
+            shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
+        print("deleted")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="rq", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    s = p.add_subparsers(dest="cmd", required=True)
+
+    def add(name, fn, *args, **kw):
+        sp = s.add_parser(name)
+        for a_, k_ in args:
+            sp.add_argument(*a_, **k_)
+        sp.set_defaults(fn=fn, **kw)
+        return sp
+
+    add("init", cmd_init, (["batch"], {}), (["--owner"], {}))
+    add("add", cmd_add, (["title"], {}), (["--original"], {}), (["--image"], {"action": "append", "default": []}),
+        (["--desc"], {"action": "append", "default": []}), (["--prio"], {}), (["--family"], {}), (["--inbox"], {"type": int}))
+    add("next", cmd_next, (["--start"], {"action": "store_true"}))
+    add("set", cmd_set, (["id"], {}), (["status"], {}), (["fields"], {"nargs": "*", "default": []}))
+    to = (["--timeout"], {"type": int, "default": int(os.environ.get("RQ_TIMEOUT", "600"))})
+    add("check", cmd_check, (["id"], {}), to)
+    add("verify", cmd_verify, (["ids"], {"nargs": "*"}), to)
+    add("evidence", cmd_evidence, (["id"], {}), (["crit"], {}), (["text"], {}))
+    add("show", cmd_show, (["id"], {}))
+    add("list", cmd_list, (["--all"], {"action": "store_true"}))
+    add("lint", cmd_lint)
+    add("related", cmd_related, (["path"], {}))
+    add("stats", cmd_stats)
+    add("status", cmd_status, (["--json"], {"action": "store_true"}))
+    add("close", cmd_close, (["--carry"], {}))
+    add("inbox", cmd_inbox, (["--add"], {"action": "store_true"}), (["--skip"], {}))
+    add("gate", cmd_gate, (["--worktree"], {"action": "store_true"}))
+    add("refs", cmd_refs, (["words"], {"nargs": "+"}), (["--root"], {"action": "append"}), (["--pin"], {}),
+        (["-n"], {"type": int, "default": 5}))
+    add("consumers", cmd_consumers, (["path"], {}), (["--write"], {}))
+    add("gc", cmd_gc, (["--days"], {"type": int, "default": 30}), (["--apply"], {"action": "store_true"}))
+    a = p.parse_args()
+    if a.cmd not in ("init", "add", "next", "set", "evidence", "close", "inbox"):
+        return a.fn(a)
+    os.makedirs(B, exist_ok=True)  # ponytail: one global lock for short writes; verify/check run unlocked
+    with open(os.path.join(B, ".lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

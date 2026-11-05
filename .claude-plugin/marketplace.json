@@ -1,0 +1,12 @@
+{
+  "name": "relay",
+  "owner": { "name": "luzanovdm", "url": "https://github.com/luzanovdm" },
+  "description": "Relay: a strict revision-queue work loop for coding agents.",
+  "plugins": [
+    {
+      "name": "relay",
+      "source": "./",
+      "description": "A strict revision-queue work loop for coding agents, with the rq tool and Claude Code hooks."
+    }
+  ]
+}
